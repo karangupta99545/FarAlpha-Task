@@ -1,0 +1,117 @@
+name: CI/CD Pipeline - Deploy to Azure VM
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Test Suite
+        run: npm test
+
+  deploy:
+    name: Deploy to Virtual Machine
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Prepare Remote Directory on VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USERNAME }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          port: 22
+          script: |
+            mkdir -p /home/${{ secrets.VM_USERNAME }}/app
+
+      - name: Copy Files to VM (Direct Artifact Deployment - No Git Pull)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USERNAME }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          port: 22
+          source: "server.js,package.json"
+          target: "/home/${{ secrets.VM_USERNAME }}/app"
+          strip_components: 0
+
+      - name: Install Dependencies & Run App on Port 80
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USERNAME }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+
+            # 1. Ensure Node.js is installed
+            if ! command -v node > /dev/null 2>&1; then
+              echo "Installing Node.js 20.x..."
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+
+            # 2. Ensure PM2 is installed globally
+            if ! command -v pm2 > /dev/null 2>&1; then
+              echo "Installing PM2 process manager..."
+              sudo npm install -g pm2
+            fi
+
+            # 3. Allow Node.js binary to bind to privileged Port 80 without root
+            NODE_PATH=$(readlink -f $(which node))
+            sudo setcap 'cap_net_bind_service=+ep' "$NODE_PATH"
+
+            # 4. Navigate to app directory and install production dependencies
+            cd /home/${{ secrets.VM_USERNAME }}/app
+            npm install --omit=dev
+
+            # 5. Start or reload application with PM2 on Port 80
+            export PORT=80
+            if pm2 describe sayhello-api > /dev/null 2>&1; then
+              echo "Reloading existing PM2 instance..."
+              pm2 restart sayhello-api --update-env
+            else
+              echo "Starting new PM2 instance on port 80..."
+              pm2 start server.js --name sayhello-api --env production
+            fi
+
+            pm2 save
+
+            # 6. Post-deployment self-check
+            echo "Verifying local API response on Port 80..."
+            sleep 2
+            curl -s -f http://127.0.0.1:80/sayHello || (echo "Health check failed!" && exit 1)
+            echo "Deployment verified successfully!"
+
+      - name: Post-Deployment Verification Notice
+        if: success()
+        run: |
+          echo "=========================================================="
+          echo "Deployment Successful!"
+          echo "Verify endpoint at: http://${{ secrets.VM_HOST }}/sayHello"
+          echo "=========================================================="
+
+      - name: Deployment Failure Alert
+        if: failure()
+        run: |
+          echo "::error::Deployment failed. Check the logs above for details."
